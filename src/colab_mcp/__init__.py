@@ -119,8 +119,12 @@ async def update_cell(cellId: str = "", content: str = "") -> str:
 
 
 @mcp.tool()
-async def get_cells() -> str:
-    """Read all cells (id, type, source, outputs) from the Colab notebook. Requires an active browser connection via open_colab_browser_connection."""
+async def get_cells(connect: bool = True) -> str:
+    """Read all cells (id, type, source, outputs) from the Colab notebook. Requires an active browser connection via open_colab_browser_connection.
+
+    Args:
+        connect: Unused; added for Claude Code MCP compatibility (works around zero-param tool bug).
+    """
     return await _forward_or_stub("get_cells", {})
 
 
