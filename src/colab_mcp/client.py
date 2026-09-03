@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Ported from SebastianGilPinzon/colab-mcp
+# https://github.com/SebastianGilPinzon/colab-mcp
 
 import abc
 from dataclasses import dataclass
@@ -203,7 +205,7 @@ class ColabClient:
         if not v.startswith(XSSI_PREFIX):
             self.logger.debug(f"XSSI prefix not found in response: {v}")
             return v
-        stripped_v = v[len(XSSI_PREFIX) :]
+        stripped_v = v[len(XSSI_PREFIX):]
         self.logger.debug(f"Stripped XSSI prefix, returning: {stripped_v}")
         return stripped_v
 

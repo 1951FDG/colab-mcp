@@ -16,7 +16,6 @@ import argparse
 import asyncio
 import datetime
 import logging
-import os
 import tempfile
 import sys
 import webbrowser
@@ -25,8 +24,6 @@ from fastmcp import FastMCP
 from fastmcp.utilities import logging as fastmcp_logger
 
 from colab_mcp.session import ColabSessionProxy, NOT_CONNECTED_MSG
-from colab_mcp.websocket_server import COLAB, SCRATCH_PATH
-from colab_mcp import process_registry
 
 
 mcp = FastMCP(name="ColabMCP")
@@ -35,8 +32,11 @@ mcp = FastMCP(name="ColabMCP")
 _proxy_client = None
 _session_mcp = None
 _colab_client = None  # For runtime API (assign/unassign GPU)
+_runtime_tool = None  # For executing code on the Colab runtime via Jupyter kernel
 
 
+# Startup tool registration (invisible tools fix), change_runtime, and _forward_or_stub
+# from SebastianGilPinzon/colab-mcp — https://github.com/SebastianGilPinzon/colab-mcp
 async def _forward_or_stub(tool_name: str, arguments: dict) -> str:
     """Forward a tool call to the browser if connected, otherwise return stub message."""
     if _proxy_client is not None and _proxy_client.is_connected():
@@ -52,20 +52,36 @@ async def _forward_or_stub(tool_name: str, arguments: dict) -> str:
 
 
 @mcp.tool()
-async def open_colab_browser_connection() -> str:
-    """Opens a connection to a Google Colab browser session and unlocks notebook editing tools. Returns whether the connection attempt succeeded."""
+async def open_colab_browser_connection(notebook_url: str = "") -> str:
+    """Opens a connection to a Google Colab browser session and unlocks notebook editing tools.
+
+    Args:
+        notebook_url: Optional Colab notebook URL to open for this connection. Must be on
+            colab.research.google.com (or the alt domain) — non-Colab origins are ignored
+            and fall back to the server-launch default. If empty, uses the URL configured
+            via the ``-n/--notebook`` server flag (or a scratch notebook).
+
+    Returns whether the connection attempt succeeded.
+    """
     if _proxy_client is not None and _proxy_client.is_connected():
         return "Already connected to Colab."
 
     if _proxy_client is None:
         return "Server not initialized. Please wait and try again."
 
-    # `?p=<port>` forces a unique URL per server instance so Chrome can't
-    # silently reuse a stale tab from a prior session (whose fragment points
-    # at a dead port). The fragment remains the source of truth for Colab.
-    webbrowser.open_new(
-        f"{COLAB}{SCRATCH_PATH}?p={_proxy_client.wss.port}#mcpProxyToken={_proxy_client.wss.token}&mcpProxyPort={_proxy_client.wss.port}"
-    )
+    if notebook_url:
+        _proxy_client.wss.notebook_url = notebook_url
+    colab_url = _proxy_client.wss.get_colab_url()
+
+    # Remote connection CLI args (-n/-H/-P/--no-browser) from ZeroPointSix/colab-mcp
+    # https://github.com/ZeroPointSix/colab-mcp
+    if _session_mcp is not None and _session_mcp.no_browser:
+        print(
+            f"\nOpen this URL in your browser to connect to Colab:\n  {colab_url}\n",
+            file=sys.stderr,
+        )
+    else:
+        webbrowser.open_new(colab_url)
 
     # Wait for browser to connect
     await _proxy_client.await_proxy_connection()
@@ -74,41 +90,8 @@ async def open_colab_browser_connection() -> str:
         tool_names = await _proxy_client.await_tools_ready()
         tools_text = ", ".join(tool_names) if tool_names else "none discovered"
         return f"Connection successful. Available notebook tools: {tools_text}. You can now create, edit, and execute cells in the Colab notebook."
-
-    # Timed out — surface diagnostic info about other running servers so the
-    # user can recognize the "old browser tab pointed at a dead port" case.
-    try:
-        others = [
-            e for e in process_registry.list_running()
-            if e.pid != os.getpid()
-        ]
-    except Exception:
-        others = []
-    my_port = _proxy_client.wss.port
-    if others:
-        peer_ports = ", ".join(f"{e.port} (pid {e.pid})" for e in others)
-        return (
-            f"Connection timed out. This server is on port {my_port}, but "
-            f"{len(others)} other colab-mcp server(s) are also running: "
-            f"{peer_ports}. If you have an old Colab tab open, it may be "
-            "pointing at one of those instead of this server. Either close "
-            "the old tab and let me open a fresh one, or run `colab-mcp "
-            "--kill-stale` to clean up orphaned servers."
-        )
-    return (
-        f"Connection timed out. This server is on port {my_port}. Common causes:\n"
-        "  1. Stale Colab tab(s) - if Chrome reused an old tab whose URL "
-        "fragment points at a dead port, the tab will say 'Disconnected from "
-        "the local Colab MCP server'. Close every existing colab.research.google.com "
-        "tab, then retry - `?p=<port>` in the URL is used to force Chrome to "
-        "open a fresh tab per server instance.\n"
-        "  2. Local Network Access permission denied - Chrome shows a prompt "
-        "the first time Colab tries to reach localhost. Click 'Allow'. If you "
-        "previously clicked 'Block', open colab.research.google.com -> site "
-        "settings -> reset the 'Insecure content' / 'Other' permission and retry.\n"
-        "  3. Browser tab was never opened - make sure your default browser "
-        "is set and not blocking pop-ups for python.exe."
-    )
+    else:
+        return "Connection timed out. Please make sure you have a Colab notebook open in your browser and try again."
 
 
 @mcp.tool()
@@ -124,14 +107,8 @@ async def add_text_cell(content: str = "", cellIndex: int = -1) -> str:
 
 
 @mcp.tool()
-async def get_cells() -> str:
-    """Read the current notebook state: list of cells with their IDs, contents, and outputs. Essential for iterative work (write -> run -> read -> adjust). Requires an active browser connection via open_colab_browser_connection."""
-    return await _forward_or_stub("get_cells", {})
-
-
-@mcp.tool()
-async def run_code_cell(cellId: str = "") -> str:
-    """Execute a code cell in the Colab notebook by cellId (from add_code_cell or get_cells). Requires an active browser connection via open_colab_browser_connection."""
+async def execute_cell(cellId: str = "") -> str:
+    """Execute a cell in the Colab notebook. Pass cellId (from add_code_cell or get_cells result). Requires an active browser connection via open_colab_browser_connection."""
     return await _forward_or_stub("run_code_cell", {"cellId": cellId})
 
 
@@ -142,20 +119,26 @@ async def update_cell(cellId: str = "", content: str = "") -> str:
 
 
 @mcp.tool()
-async def delete_cell(cellId: str = "") -> str:
-    """Delete a cell from the Colab notebook by cellId. Requires an active browser connection via open_colab_browser_connection."""
-    return await _forward_or_stub("delete_cell", {"cellId": cellId})
+async def get_cells() -> str:
+    """Read all cells (id, type, source, outputs) from the Colab notebook. Requires an active browser connection via open_colab_browser_connection."""
+    return await _forward_or_stub("get_cells", {})
 
 
 @mcp.tool()
 async def move_cell(cellId: str = "", cellIndex: int = 0) -> str:
-    """Move a cell to a new position in the Colab notebook by cellId and target index. Requires an active browser connection via open_colab_browser_connection."""
+    """Move an existing cell to a new index in the Colab notebook. Requires an active browser connection via open_colab_browser_connection."""
     return await _forward_or_stub("move_cell", {"cellId": cellId, "cellIndex": cellIndex})
 
 
 @mcp.tool()
+async def delete_cell(cellId: str = "") -> str:
+    """Delete a cell from the Colab notebook. Requires an active browser connection via open_colab_browser_connection."""
+    return await _forward_or_stub("delete_cell", {"cellId": cellId})
+
+
+@mcp.tool()
 async def change_runtime(accelerator: str = "T4") -> str:
-    """Change the Colab runtime to use a specific GPU accelerator. Valid values: NONE, T4, L4, A100. Requires OAuth setup (first time opens browser for consent)."""
+    """Change the Colab runtime to use a specific GPU accelerator. Valid values: NONE, T4, L4, A100. Requires OAuth setup (first time opens browser for consent). Configure with --client-oauth-config."""
     if _colab_client is None:
         return "Runtime API not initialized. Start with --client-oauth-config flag pointing to your OAuth client secrets JSON."
     try:
@@ -171,8 +154,8 @@ async def change_runtime(accelerator: str = "T4") -> str:
             assignments = _colab_client.list_assignments()
             for a in assignments:
                 _colab_client.unassign(a.endpoint)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning("Failed to unassign existing runtime(s): %s", e)
 
         # Assign new VM
         result = _colab_client.assign(notebook_hash, variant, acc)
@@ -213,83 +196,73 @@ def parse_args(v):
         action="store_true",
         default=True,
     )
+    # Remote connection CLI args (-n/-H/-P/--no-browser) from ZeroPointSix/colab-mcp
+    # https://github.com/ZeroPointSix/colab-mcp
+    parser.add_argument(
+        "-n",
+        "--notebook",
+        help="URL or path of the Colab notebook to open (default: empty scratch notebook).",
+        action="store",
+        default=None,
+    )
+    parser.add_argument(
+        "-H",
+        "--host",
+        help="Host address for the WebSocket server to bind to (default: localhost).",
+        action="store",
+        default="localhost",
+    )
+    parser.add_argument(
+        "-P",
+        "--port",
+        help="Port for the WebSocket server to bind to (default: 0, random port).",
+        action="store",
+        default=0,
+        type=int,
+    )
+    parser.add_argument(
+        "--no-browser",
+        help="Do not auto-open a browser session. Instead, print the connection URL to stderr.",
+        action="store_true",
+        default=False,
+    )
     parser.add_argument(
         "--client-oauth-config",
         help="Path to OAuth client secrets JSON for Colab API access (enables change_runtime tool).",
         action="store",
         default=None,
     )
+    # --enable-runtime from anthony-maio/colab-mcp — https://github.com/anthony-maio/colab-mcp
     parser.add_argument(
-        "--list-running",
-        help="List all currently-running colab-mcp servers and exit.",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument(
-        "--kill-stale",
-        help="Terminate all running colab-mcp servers (including this one is NOT included) and exit. Useful when the browser shows 'Disconnected from the local Colab MCP server' due to orphaned processes from prior sessions.",
+        "-r",
+        "--enable-runtime",
+        help="Enable runtime tools (execute_code) for running code on a Colab Jupyter kernel without a browser. Requires --client-oauth-config.",
         action="store_true",
         default=False,
     )
     return parser.parse_args(v)
 
 
-def _print_running_servers() -> None:
-    entries = process_registry.list_running()
-    if not entries:
-        print("No colab-mcp servers currently registered as running.")
-        return
-    print(f"Found {len(entries)} running colab-mcp server(s):")
-    import datetime as _dt
-    for e in entries:
-        started = _dt.datetime.fromtimestamp(e.started_at).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"  pid={e.pid:<6}  port={e.port:<6}  host={e.host}  started={started}")
-
-
 async def main_async():
-    global _proxy_client, _session_mcp, _colab_client
+    global _proxy_client, _session_mcp, _colab_client, _runtime_tool
     args = parse_args(sys.argv[1:])
     init_logger(args.log)
 
-    # Diagnostic / cleanup flags exit early.
-    if args.list_running:
-        _print_running_servers()
-        return
-    if args.kill_stale:
-        removed = process_registry.cleanup_stale(kill=True)
-        if not removed:
-            print("No stale colab-mcp servers found.")
-        else:
-            print(f"Terminated {len(removed)} stale colab-mcp server(s):")
-            for e in removed:
-                print(f"  pid={e.pid} port={e.port}")
-        return
-
-    # Prune any dead entries from prior crashed runs BEFORE we bind a port.
-    # This keeps the registry honest. We don't auto-kill ALIVE entries here —
-    # multiple clients (e.g., two Claude Code instances) are valid; only the
-    # browser-tab confusion is the bug, and the per-tab token fragment scopes
-    # which server a tab talks to.
-    dead = process_registry.prune_dead()
-    if dead:
-        logging.info(f"Pruned {dead} stale entries from process registry")
-
     if args.enable_proxy:
         logging.info("enabling session proxy tools")
-        _session_mcp = ColabSessionProxy()
+        if args.host not in ("127.0.0.1", "localhost", "::1"):
+            logging.warning(
+                f"WebSocket server binding to {args.host}, which exposes it to the network. "
+                "Ensure your firewall is configured appropriately."
+            )
+        _session_mcp = ColabSessionProxy(
+            notebook_url=args.notebook,
+            host=args.host,
+            port=args.port,
+            no_browser=args.no_browser,
+        )
         await _session_mcp.start_proxy_server()
         _proxy_client = _session_mcp.proxy_client
-        # Register ourselves now that we know the port.
-        try:
-            entry = process_registry.register(
-                port=_session_mcp.wss.port,
-                host=_session_mcp.wss.host,
-            )
-            logging.info(
-                f"Registered colab-mcp pid={entry.pid} port={entry.port}"
-            )
-        except Exception as exc:
-            logging.warning(f"Could not register process: {exc}")
 
     if args.client_oauth_config:
         try:
@@ -302,17 +275,36 @@ async def main_async():
         except Exception as e:
             logging.warning(f"Failed to initialize Colab API client: {e}")
 
+    if args.enable_runtime:
+        # execute_code tool: run code on a Colab Jupyter kernel without a browser.
+        # Ported from anthony-maio/colab-mcp — https://github.com/anthony-maio/colab-mcp
+        if not args.client_oauth_config:
+            logging.warning(
+                "--enable-runtime requires --client-oauth-config; runtime tools disabled."
+            )
+        else:
+            try:
+                from colab_mcp.auth import get_credentials
+                from colab_mcp import runtime as colab_runtime
+                # Pre-fetch credentials so we fail fast if OAuth isn't set up.
+                get_credentials(args.client_oauth_config)
+                _runtime_tool = colab_runtime.ColabRuntimeTool()
+                mcp.mount(_runtime_tool.mcp, prefix="runtime")
+                logging.info("enabling runtime tools (runtime_execute_code)")
+            except Exception as e:
+                logging.warning(f"Failed to initialize runtime tools: {e}")
+
     try:
         await mcp.run_async()
 
     finally:
         if args.enable_proxy and _session_mcp:
             await _session_mcp.cleanup()
-        # Always unregister so a clean shutdown doesn't leave a stale entry.
-        try:
-            process_registry.unregister()
-        except Exception as exc:
-            logging.warning(f"Could not unregister process: {exc}")
+        if _runtime_tool is not None:
+            try:
+                _runtime_tool.stop()
+            except Exception as e:
+                logging.warning(f"runtime cleanup failed: {e}")
 
 
 def main() -> None:

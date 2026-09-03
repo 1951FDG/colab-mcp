@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Ported from SebastianGilPinzon/colab-mcp
+# https://github.com/SebastianGilPinzon/colab-mcp
 
 import os
 from google_auth_oauthlib.flow import InstalledAppFlow
