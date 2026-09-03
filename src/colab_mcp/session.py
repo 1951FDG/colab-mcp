@@ -16,10 +16,9 @@ import asyncio
 from collections.abc import AsyncIterator
 import contextlib
 from contextlib import AsyncExitStack
+import logging
 from fastmcp import FastMCP, Client
 from fastmcp.client.transports import ClientTransport
-from fastmcp.dependencies import CurrentContext
-from fastmcp.server.context import Context
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.middleware.tool_injection import ToolInjectionMiddleware
 from fastmcp.server.proxy import FastMCPProxy
@@ -30,12 +29,31 @@ import webbrowser
 
 from colab_mcp.websocket_server import ColabWebSocketServer, COLAB, SCRATCH_PATH
 
-UI_CONNECTION_TIMEOUT = 60.0  # secs
+logger = logging.getLogger(__name__)
 
-FE_CONNECTED_KEY = "fe_connected"
-PROXY_TOKEN_KEY = "proxy_token"
-PROXY_PORT_KEY = "proxy_port"
+UI_CONNECTION_TIMEOUT = 60.0  # secs
+TOOLS_READY_TIMEOUT = 10.0  # secs
+TOOLS_READY_POLL_INTERVAL = 0.5  # secs
+
 INJECTED_TOOL_NAME = "open_colab_browser_connection"
+
+NOT_CONNECTED_MSG = (
+    "Not connected to a Google Colab browser session. "
+    "Please call open_colab_browser_connection first to establish a connection, "
+    "then retry this tool."
+)
+
+
+def _make_stub_server() -> FastMCP:
+    """Create an empty FastMCP server used as fallback when no browser is connected.
+
+    The actual stub tools are provided by ToolInjectionMiddleware via
+    _make_injected_tools(). This server must remain empty to avoid
+    duplicate tool names (the proxy's ProxyToolManager merges tools from
+    this server with those from the middleware, so any tools defined here
+    would appear twice in tools/list).
+    """
+    return FastMCP("colab-notebook-stubs")
 
 
 class ColabTransport(ClientTransport):
@@ -56,7 +74,7 @@ class ColabTransport(ClientTransport):
 class ColabProxyClient:
     def __init__(self, wss: ColabWebSocketServer):
         self.wss = wss
-        self.stubbed_mcp_client = Client(FastMCP())
+        self.stubbed_mcp_client = Client(_make_stub_server())
         self.proxy_mcp_client: Client | None = None
         self._exit_stack = AsyncExitStack()
         self._start_task = None
@@ -74,6 +92,22 @@ class ColabProxyClient:
                 connection_tasks,
                 timeout=UI_CONNECTION_TIMEOUT,
             )
+
+    async def await_tools_ready(self) -> list[str]:
+        """Poll the proxy client until remote tools are available."""
+        if not self.is_connected():
+            return []
+        elapsed = 0.0
+        while elapsed < TOOLS_READY_TIMEOUT:
+            try:
+                tools = await self.proxy_mcp_client.list_tools()
+                if tools:
+                    return [t.name for t in tools]
+            except Exception:
+                pass
+            await asyncio.sleep(TOOLS_READY_POLL_INTERVAL)
+            elapsed += TOOLS_READY_POLL_INTERVAL
+        return []
 
     def client_factory(self):
         if self.is_connected():
@@ -107,12 +141,6 @@ class ColabProxyMiddleware(Middleware):
         Check for a change to Colab session connectivity on any communication with this MCP server and
         notify the client when the connectivity status has changed.
         """
-        context.fastmcp_context.set_state(
-            FE_CONNECTED_KEY, self.proxy_client.is_connected()
-        )
-        context.fastmcp_context.set_state(PROXY_TOKEN_KEY, self.proxy_client.wss.token)
-        context.fastmcp_context.set_state(PROXY_PORT_KEY, self.proxy_client.wss.port)
-
         result = await call_next(context)
 
         connected = self.proxy_client.is_connected()
@@ -131,26 +159,44 @@ class ColabProxyMiddleware(Middleware):
             return result
         # if the tool call was for open_colab_browser_connection and there is no existing connection, try to await full connection
         await context.fastmcp_context.report_progress(
-            progress=1, total=3, message="The user is not connected to the Colab UI"
+            progress=1, total=4, message="The user is not connected to the Colab UI"
         )
         await context.fastmcp_context.report_progress(
             progress=2,
-            total=3,
+            total=4,
             message="Waiting for user to connect in Colab - will wait for 60s",
         )
         await self.proxy_client.await_proxy_connection()
         if self.proxy_client.is_connected():
             await context.fastmcp_context.report_progress(
-                progress=3, total=3, message="The Colab UI is successfully connected!"
+                progress=3,
+                total=4,
+                message="Connected! Waiting for notebook tools to become available...",
             )
+            tool_names = await self.proxy_client.await_tools_ready()
+            tools_text = ", ".join(tool_names) if tool_names else "none discovered"
+            await context.fastmcp_context.report_progress(
+                progress=4,
+                total=4,
+                message=f"Ready! Available tools: {tools_text}",
+            )
+            await context.fastmcp_context.send_tool_list_changed()
             return ToolResult(
-                content=[TextContent(type="text", text="true")],
-                structured_content={"result": True},
+                content=[
+                    TextContent(
+                        type="text",
+                        text=f"Connection successful. Available notebook tools: {tools_text}. You can now create, edit, and execute cells in the Colab notebook.",
+                    )
+                ],
+                structured_content={
+                    "result": True,
+                    "available_tools": tool_names,
+                },
             )
         else:
             await context.fastmcp_context.report_progress(
-                progress=3,
-                total=3,
+                progress=4,
+                total=4,
                 message="Timeout while waiting for the user to connect.",
             )
             return ToolResult(
@@ -159,46 +205,106 @@ class ColabProxyMiddleware(Middleware):
             )
 
 
-async def check_session_proxy_tool_fn(ctx: Context = CurrentContext()) -> bool:
-    fe_connected = ctx.get_state(FE_CONNECTED_KEY)
-    token = ctx.get_state(PROXY_TOKEN_KEY)
-    port = ctx.get_state(PROXY_PORT_KEY)
-    if fe_connected:
-        return True
-    webbrowser.open_new(
-        f"{COLAB}{SCRATCH_PATH}#mcpProxyToken={token}&mcpProxyPort={port}"
-    )
-    return False
+def _make_injected_tools(
+    proxy_client: ColabProxyClient,
+) -> list[Tool]:
+    """Create all injected tools: connection tool + notebook stub tools.
 
+    The stub tools are pre-registered so MCP clients that snapshot tools at
+    startup can discover them immediately. When the browser is not connected,
+    they return a helpful message. When connected, the proxy forwards calls
+    to the real browser-side MCP transparently (the middleware intercepts
+    calls to stub tool names and delegates to the proxy when connected).
+    """
 
-check_session_proxy_tool = Tool.from_function(
-    fn=check_session_proxy_tool_fn,
-    name=INJECTED_TOOL_NAME,
-    description="Opens a connection to a Google Colab browser session and unlocks notebook editing tools. Returns a boolean representing whether the connection attempt succeeded",
-)
+    async def check_session_proxy_tool_fn() -> bool:
+        if proxy_client.is_connected():
+            return True
+        # Query param `?p=<port>` forces a unique URL per server instance so
+        # Chrome opens a fresh tab instead of silently reusing a stale tab
+        # left over from a prior session (whose fragment points at a dead
+        # port). The fragment is still the source of truth for Colab's
+        # browser-side code.
+        webbrowser.open_new(
+            f"{COLAB}{SCRATCH_PATH}?p={proxy_client.wss.port}#mcpProxyToken={proxy_client.wss.token}&mcpProxyPort={proxy_client.wss.port}"
+        )
+        return False
+
+    async def add_code_cell_stub(code: str = "", cellIndex: int = 0, language: str = "python") -> str:
+        return NOT_CONNECTED_MSG
+
+    async def add_text_cell_stub(content: str = "", cellIndex: int = -1) -> str:
+        return NOT_CONNECTED_MSG
+
+    async def get_cells_stub() -> str:
+        return NOT_CONNECTED_MSG
+
+    async def run_code_cell_stub(cellId: str = "") -> str:
+        return NOT_CONNECTED_MSG
+
+    async def update_cell_stub(cellId: str = "", content: str = "") -> str:
+        return NOT_CONNECTED_MSG
+
+    async def delete_cell_stub(cellId: str = "") -> str:
+        return NOT_CONNECTED_MSG
+
+    async def move_cell_stub(cellId: str = "", cellIndex: int = 0) -> str:
+        return NOT_CONNECTED_MSG
+
+    return [
+        Tool.from_function(
+            fn=check_session_proxy_tool_fn,
+            name=INJECTED_TOOL_NAME,
+            description="Opens a connection to a Google Colab browser session and unlocks notebook editing tools. Returns a boolean representing whether the connection attempt succeeded",
+        ),
+        Tool.from_function(
+            fn=add_code_cell_stub,
+            name="add_code_cell",
+            description="Add a new code cell to the Colab notebook. Requires an active browser connection via open_colab_browser_connection.",
+        ),
+        Tool.from_function(
+            fn=add_text_cell_stub,
+            name="add_text_cell",
+            description="Add a new text/markdown cell to the Colab notebook. Requires an active browser connection via open_colab_browser_connection.",
+        ),
+        Tool.from_function(
+            fn=get_cells_stub,
+            name="get_cells",
+            description="Read the current notebook state: list of cells with their IDs, contents, and outputs. Essential for iterative work (write -> run -> read -> adjust). Requires an active browser connection via open_colab_browser_connection.",
+        ),
+        Tool.from_function(
+            fn=run_code_cell_stub,
+            name="run_code_cell",
+            description="Execute a code cell in the Colab notebook by cellId. Requires an active browser connection via open_colab_browser_connection.",
+        ),
+        Tool.from_function(
+            fn=update_cell_stub,
+            name="update_cell",
+            description="Update the contents of an existing cell in the Colab notebook. Requires an active browser connection via open_colab_browser_connection.",
+        ),
+        Tool.from_function(
+            fn=delete_cell_stub,
+            name="delete_cell",
+            description="Delete a cell from the Colab notebook by cellId. Requires an active browser connection via open_colab_browser_connection.",
+        ),
+        Tool.from_function(
+            fn=move_cell_stub,
+            name="move_cell",
+            description="Move a cell to a new position in the Colab notebook by cellId and target index. Requires an active browser connection via open_colab_browser_connection.",
+        ),
+    ]
 
 
 class ColabSessionProxy:
     def __init__(self):
         self._exit_stack = AsyncExitStack()
-        self.proxy_server: FastMCPProxy | None = None
-        # list order matters, see: https://gofastmcp.com/servers/middleware#multiple-middleware
-        self.middleware: list[Middleware] = []
+        self.proxy_client: ColabProxyClient | None = None
         self.wss: ColabWebSocketServer | None = None
 
     async def start_proxy_server(self):
         self.wss = await self._exit_stack.enter_async_context(ColabWebSocketServer())
-        proxy_client = await self._exit_stack.enter_async_context(
+        self.proxy_client = await self._exit_stack.enter_async_context(
             ColabProxyClient(self.wss)
-        )
-        self.proxy_server = FastMCPProxy(
-            client_factory=proxy_client.client_factory,
-            instructions="Connects to a user's Google Colab session in a browser and allows for interactions with their Google Colab notebook",
-        )
-        # ColabProxyMiddleware must be first because it sets the fe_connected state
-        self.middleware.append(ColabProxyMiddleware(proxy_client))
-        self.middleware.append(
-            ToolInjectionMiddleware(tools=[check_session_proxy_tool])
         )
 
     async def cleanup(self):

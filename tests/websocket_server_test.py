@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import contextlib
 from colab_mcp.websocket_server import ColabWebSocketServer
 from mcp.types import JSONRPCRequest, JSONRPCResponse, JSONRPCMessage
 from mcp.shared.message import SessionMessage
@@ -200,6 +201,113 @@ async def test_malformed_auth_header():
                 subprotocols=["mcp"],
                 additional_headers={"Authorization": f"Bearer?{server.token}"},
             )
+
+
+@pytest.mark.asyncio
+async def test_single_socket_single_port():
+    """Server must bind to exactly one socket on one port.
+
+    Defends against the dual-stack bug: with host='localhost' + port=0,
+    websockets binds IPv4 AND IPv6 on different ephemeral ports. The
+    Colab tab connects via ws://localhost:<port>, Chrome picks one
+    address family, and connects to the WRONG port (no listener) — the
+    user sees "Disconnected from the local Colab MCP server".
+    """
+    async with ColabWebSocketServer() as server:
+        sockets = list(server._server.sockets)
+        assert len(sockets) >= 1, "expected at least one bound socket"
+        ports = {s.getsockname()[1] for s in sockets}
+        assert ports == {server.port}, (
+            f"server bound to multiple ports {sorted(ports)}; the Colab "
+            f"tab would only reach one of them and the others would "
+            f"silently fail with 'Disconnected'."
+        )
+
+
+def _ci_get(headers, name):
+    """Case-insensitive HTTP header lookup. HTTP headers are case-insensitive."""
+    target = name.lower()
+    for k, v in headers.items():
+        if k.lower() == target:
+            return v
+    return None
+
+
+@pytest.mark.asyncio
+async def test_cors_preflight_responds_with_pna_headers():
+    """Non-WebSocket request must return PNA + CORS headers.
+
+    Chrome's Private Network Access spec requires this for ANY connection
+    from a public origin (https://colab.research.google.com) to a local
+    server (ws://localhost). Without these headers, Chrome silently
+    cancels the WebSocket upgrade and the tab shows "Disconnected".
+    Uses a raw asyncio socket to send a plain HTTP GET (no Upgrade), so
+    the server's process_request callback responds with the preflight.
+    """
+    async with ColabWebSocketServer() as server:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        writer.write(
+            b"GET / HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Origin: https://colab.research.google.com\r\n"
+            b"\r\n"
+        )
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(2048), timeout=2)
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+
+        text = raw.decode("latin-1")
+        assert text.startswith("HTTP/1.1 204"), f"expected 204 No Content, got: {text[:80]}"
+        # Parse headers case-insensitively
+        headers = {}
+        for line in text.split("\r\n")[1:]:
+            if not line:
+                break
+            if ":" in line:
+                k, v = line.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+        assert headers.get("access-control-allow-private-network") == "true", (
+            f"missing PNA header; got: {headers}"
+        )
+        assert (
+            headers.get("access-control-allow-origin")
+            == "https://colab.research.google.com"
+        )
+
+
+@pytest.mark.asyncio
+async def test_websocket_handshake_response_has_pna_header():
+    """The 101 Switching Protocols response must also carry the PNA header.
+
+    Chrome re-checks PNA on the upgrade response itself, not just the
+    preflight. Without it, the connection is terminated immediately after
+    handshake.
+    """
+    async with ColabWebSocketServer() as server:
+        client = await websockets.connect(
+            f"ws://localhost:{server.port}",
+            origin="https://colab.research.google.com",
+            subprotocols=["mcp"],
+            additional_headers={"Authorization": f"Bearer {server.token}"},
+        )
+        response_headers = dict(client.response.headers)
+        assert _ci_get(response_headers, "Access-Control-Allow-Private-Network") == "true", (
+            f"PNA header missing from handshake 101; got: {response_headers}"
+        )
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_default_host_is_ipv4():
+    """Default host must be 127.0.0.1, not 'localhost', to avoid dual-stack."""
+    server = ColabWebSocketServer()
+    assert server.host == "127.0.0.1", (
+        f"default host is {server.host!r}; must be '127.0.0.1' to force "
+        f"IPv4-only bind. host='localhost' triggers dual-stack bind with "
+        f"different ports per family — see test_single_socket_single_port."
+    )
 
 
 @pytest.mark.asyncio

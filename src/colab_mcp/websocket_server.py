@@ -39,7 +39,17 @@ class ColabWebSocketServer:
     from a Google Colab session (colab.google.com).
     """
 
-    def __init__(self, host="localhost"):
+    def __init__(self, host="127.0.0.1"):
+        # IMPORTANT: default is "127.0.0.1" (IPv4-only), not "localhost".
+        # With host="localhost" + port=0, the websockets library binds
+        # dual-stack — IPv4 and IPv6 each get DIFFERENT ephemeral ports.
+        # The server then reports only one of them, but Chrome resolves
+        # "localhost" preferring IPv4 on Windows, so it connects to the
+        # wrong port (no listener) — connection drops with
+        # "stream ends after 0 bytes" and the Colab tab shows
+        # "Disconnected from the local Colab MCP server".
+        # Forcing IPv4-only binds a single socket on a single port, which
+        # is what the Colab tab actually reaches via `ws://localhost:<port>`.
         self.host = host
         self.port = 0
         self.connection_lock = asyncio.Lock()
@@ -88,7 +98,46 @@ class ColabWebSocketServer:
             # server closed write stream
             pass
 
+    def _cors_preflight_headers(self) -> list[tuple[str, str]]:
+        """CORS headers required for Chrome's Private Network Access (PNA).
+
+        A public site like https://colab.research.google.com talking to a
+        local server like ws://localhost is a "private network request"
+        under Chrome's PNA spec. Chrome stalls the WebSocket upgrade until
+        the server confirms it accepts the connection by responding with
+        `Access-Control-Allow-Private-Network: true`. Without this header,
+        the upgrade is silently cancelled, the tab shows "Disconnected from
+        the local Colab MCP server", and DevTools shows the request as
+        "Provisional headers are shown" / "Stalled".
+
+        See https://developer.chrome.com/blog/private-network-access-preflight
+        """
+        return [
+            ("Access-Control-Allow-Origin", COLAB),
+            ("Access-Control-Allow-Methods", "GET, OPTIONS"),
+            (
+                "Access-Control-Allow-Headers",
+                "authorization,content-type,sec-websocket-protocol,"
+                "sec-websocket-key,sec-websocket-version,sec-websocket-extensions",
+            ),
+            ("Access-Control-Allow-Private-Network", "true"),
+            ("Access-Control-Allow-Credentials", "true"),
+            ("Access-Control-Max-Age", "86400"),
+        ]
+
     def _validate_authorization(self, websocket: ServerConnection, request: Request):
+        # CORS preflight (OPTIONS) — Chrome's Private Network Access requires
+        # the server to confirm it accepts requests from a public origin BEFORE
+        # the actual WebSocket upgrade. Non-WebSocket requests (no Upgrade
+        # header) get a 204 with the PNA headers.
+        upgrade = request.headers.get("Upgrade", "").lower()
+        if upgrade != "websocket":
+            logging.info(
+                f"CORS preflight request: path={request.path}, "
+                f"origin={request.headers.get('Origin', '<none>')}"
+            )
+            return Response(204, "No Content", Headers(self._cors_preflight_headers()))
+
         if request.path.find(f"access_token={self.token}") != -1:
             return None
         try:
@@ -104,6 +153,20 @@ class ColabWebSocketServer:
         if token == self.token:
             return None
         return Response(403, "Bad authorization token", Headers([]))
+
+    def _augment_handshake_response(
+        self, websocket: ServerConnection, request: Request, response: Response
+    ) -> Response:
+        """Add Private Network Access headers to the WebSocket upgrade response.
+
+        Even after the OPTIONS preflight succeeds, Chrome inspects the
+        actual upgrade response (101 Switching Protocols) and re-checks PNA.
+        Without these headers on the upgrade response too, the WebSocket
+        is still terminated immediately after connect.
+        """
+        for name, value in self._cors_preflight_headers():
+            response.headers[name] = value
+        return response
 
     async def _connection_handler(self, websocket: ServerConnection):
         """
@@ -148,9 +211,34 @@ class ColabWebSocketServer:
             subprotocols=[Subprotocol("mcp")],
             origins=self.allowed_origins,
             process_request=self._validate_authorization,
+            process_response=self._augment_handshake_response,
         )
-        self.port = self._server.sockets[0].getsockname()[1]
-        logging.info(f"Starting WebSocket server on ws://{self.host}:{self.port}")
+
+        # Defense against the dual-stack bind bug: with host="localhost"
+        # and port=0, websockets binds IPv4 and IPv6 on DIFFERENT ephemeral
+        # ports, then we report only one. The Colab tab connects via
+        # ws://localhost:<port> and Chrome may resolve to whichever address
+        # family lost the lottery — connection refused, the tab shows
+        # "Disconnected from the local Colab MCP server", and the user
+        # waits 60s for a generic timeout.
+        #
+        # We force IPv4-only (host="127.0.0.1") above, but defend against
+        # surprises here too: every socket the server bound MUST share the
+        # same port, or we refuse to start.
+        ports = {s.getsockname()[1] for s in self._server.sockets}
+        if len(ports) != 1:
+            addrs = [s.getsockname() for s in self._server.sockets]
+            raise RuntimeError(
+                f"WebSocket server bound to multiple ports ({sorted(ports)}); "
+                f"the Colab tab can only reach one of them, so any other tab "
+                f"will see 'Disconnected from the local Colab MCP server'. "
+                f"Sockets: {addrs}. Set host='127.0.0.1' to avoid dual-stack "
+                f"bind, or change websockets to bind a single port."
+            )
+        self.port = ports.pop()
+        for sock in self._server.sockets:
+            logging.info(f"WebSocket server listening on {sock.getsockname()}")
+        logging.info(f"Colab tab will connect via ws://localhost:{self.port}")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
