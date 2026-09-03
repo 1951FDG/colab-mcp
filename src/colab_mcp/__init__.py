@@ -208,9 +208,9 @@ def parse_args(v):
     parser.add_argument(
         "-H",
         "--host",
-        help="Host address for the WebSocket server to bind to (default: localhost).",
+        help="Host address for the WebSocket server to bind to (default: 127.0.0.1 for IPv4-only).",
         action="store",
-        default="localhost",
+        default="127.0.0.1",
     )
     parser.add_argument(
         "-P",
@@ -237,6 +237,13 @@ def parse_args(v):
         "-r",
         "--enable-runtime",
         help="Enable runtime tools (execute_code) for running code on a Colab Jupyter kernel without a browser. Requires --client-oauth-config.",
+        action="store_true",
+        default=False,
+    )
+    # --create-new from TooCoolLa/colab-mcp — https://github.com/TooCoolLa/colab-mcp
+    parser.add_argument(
+        "--create-new",
+        help="if set, automatically open a new Colab browser tab when connecting (default: return token/port for manual input in existing tab)",
         action="store_true",
         default=False,
     )

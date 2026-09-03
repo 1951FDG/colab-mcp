@@ -39,6 +39,54 @@ NOT_CONNECTED_MSG = (
     "then retry this tool."
 )
 
+MAX_OUTPUT_LINES = 100
+
+
+def _compress_tool_result(result, max_lines=MAX_OUTPUT_LINES):
+    """Compress large text content in tool results, keeping head/tail."""
+    from mcp.types import TextContent
+    new_content = []
+    for block in result.content:
+        if isinstance(block, TextContent):
+            lines = block.text.split("\n")
+            if len(lines) > max_lines:
+                if lines and lines[-1] == "":
+                    lines.pop()
+                head = "\n".join(lines[:50])
+                tail = "\n".join(lines[-50:])
+                omitted = len(lines) - 100
+                compressed = (
+                    f"{head}\n... ({omitted} lines omitted) ...\n{tail}"
+                )
+                new_content.append(TextContent(type="text", text=compressed))
+                continue
+        new_content.append(block)
+    result.content = new_content
+
+    if result.structured_content:
+        _compress_structured_content(result.structured_content, max_lines)
+
+    return result
+
+
+def _compress_structured_content(data, max_lines=MAX_OUTPUT_LINES):
+    """Truncate text arrays in structured content (e.g. cell outputs)."""
+    if isinstance(data, dict):
+        if "text" in data and isinstance(data["text"], list):
+            text = "".join(data["text"])
+            lines = text.split("\n")
+            if len(lines) > max_lines:
+                head = "\n".join(lines[:50])
+                tail = "\n".join(lines[-50:])
+                data["text"] = [
+                    f"{head}\n... ({len(lines) - 100} lines omitted) ...\n{tail}"
+                ]
+        for v in data.values():
+            _compress_structured_content(v, max_lines)
+    elif isinstance(data, list):
+        for item in data:
+            _compress_structured_content(item, max_lines)
+
 
 def _make_stub_server() -> FastMCP:
     """Empty FastMCP server used as fallback when no browser is connected.
@@ -133,7 +181,7 @@ class ColabSessionProxy:
     def __init__(
         self,
         notebook_url: str | None = None,
-        host: str = "localhost",
+        host: str = "127.0.0.1",
         port: int = 0,
         no_browser: bool = False,
     ):

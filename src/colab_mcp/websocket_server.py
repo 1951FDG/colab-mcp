@@ -245,6 +245,7 @@ class ColabWebSocketServer:
             origins=self.allowed_origins,
             process_request=self._validate_authorization,
             process_response=self._augment_handshake_response,
+            max_size=16 * 1024 * 1024,  # 16MB to handle large cell outputs
         )
 
         # Defense against the dual-stack bind bug: with host="localhost"
